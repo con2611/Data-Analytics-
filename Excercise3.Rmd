@@ -1,0 +1,324 @@
+---
+title: "Big Data Excercise 3"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+#install.packages("knitr")
+#install.packages("rmarkdown")
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# import packages in current environment
+library(dplyr)
+library(lubridate)
+library(RSQLite)
+library(reshape2)
+library(ggplot2)
+library(pls)
+library(tidyverse)
+
+```
+
+This section of the Course Work will be completed in R markdown and split in 2 sections:
+
+1. The first part will be an extension from Ex2, applying some more data analysis tools to look further into the data for any interesting relationships, to further demonstrate some visualisation tools in R.
+
+2. The second part will apply some machine learning models to the data and compare them to see if there is any predictive power in the variables. 
+
+**Part 1**
+Load packages and read data
+``` {r, include = TRUE}
+
+library(dplyr)
+library(lubridate)
+library(pls)
+library(tidyverse)
+
+housingData <- as.data.frame(read.csv("/Users/connorsimpson-craib/Documents/UCL/BigData/iftcode/DataBases/csv/train.csv"))
+
+```
+
+Let's take a look at the data again by looking at the columns and number of variables
+``` {r}
+dim(housingData)
+
+```
+
+There are a lot of variables, what if we try and find the important ones from the previous 
+excercise which have the strongest correlation to the price of the property? 
+
+``` {r}
+#install.packages("corrplot")
+library(corrplot)
+
+important_vars <- c('full_sq', 'life_sq', 'floor', 'max_floor', 'build_year', 'num_room', 
+                    'kitch_sq', 'state', 'price_doc')
+
+corrplot(cor(housingData[,important_vars], use="complete.obs"))
+
+```
+
+
+We can see from here and the previous excercise that the full_sq is correlated with price, so lets take a closer look using the ggplot library package 
+
+``` {r}
+#install.packages("ggplot2")
+library("ggplot2")
+
+ggplot(aes(x=full_sq, y=price_doc), data=housingData) + 
+  geom_point(color='green')
+
+```
+
+We have seen that there are a lot of NA values in this data set, let's see how much data is missing as
+a percentage of each variable
+``` {r}
+library(purrr)
+
+missingdata <- map_dbl(housingData, function(x) { round((sum(is.na(x)) / length(x)) * 100, 1) })
+
+missingdata <- missingdata[missingdata> 0]
+
+data.frame(miss=missingdata, var=names(missingdata), row.names=NULL) %>%
+  ggplot(aes(x=reorder(var, -miss), y=miss)) + 
+  geom_bar(stat='identity', fill='red') +
+  labs(x='', y='percentage', title='Missing Data') +
+  theme(axis.text.x=element_text(angle=90, hjust=1))
+
+```
+
+Are there any outliers? 
+``` {r}
+ggplot(aes(x=full_sq, y=price_doc), data=housingData) + 
+  geom_point(color='green')
+
+```
+
+Let's remove some of those outliers manually
+``` {r}
+
+housingData <- housingData[housingData[,"full_sq"] < 200,]
+housingData <- housingData[housingData[,"full_sq"] > 6,]
+
+ggplot(aes(x=full_sq, y=price_doc), data=housingData) + 
+  geom_point(color='blue')
+
+```
+
+
+By definition, we assume that life_sq must be less than full_sq. So there should be no cases where this assumption doesn't hold, let see. 
+
+``` {r}
+
+sum(housingData$life_sq > housingData$full_sq, na.rm=TRUE)
+
+```
+
+There are 31 cases where life_sq is larger, so lets remove them
+
+``` {r}
+
+housingData <- housingData[housingData[, "full_sq"] > housingData[, "life_sq"],]
+
+```
+
+Now we have a much cleaner data set.
+Let's look at the at the distribution of some correlated variables like the num_room and floor variables.
+
+``` {r}
+table(housingData$num_room)
+ggplot(aes(x=num_room),data=housingData) + 
+  geom_histogram(fill='green', bins=20) + 
+  ggtitle('Distribution of num_rooms')
+```
+
+``` {r}
+table(housingData$floor)
+ggplot(aes(x=floor),data=housingData) + 
+  geom_histogram(fill='blue', bins=20) + 
+  ggtitle('Distribution of floor')
+```
+
+It might also be interesting to to look at the relationship between mean price and build year over time
+
+``` {r}
+
+housingData %>% 
+  filter(build_year > 1700 & build_year < 2018) %>%
+  group_by(build_year) %>% 
+  summarize(mean_build_price=mean(price_doc)) %>%
+  ggplot(aes(x=build_year, y=mean_build_price)) +
+  geom_line(stat='identity', color='orange') + 
+  geom_smooth(color='grey') +
+  ggtitle('Mean price per build year')
+```
+
+Some large variation in the early 1900's, most likely due to the limited observations available in the data set. 
+
+--
+
+**Section 2**
+
+In this section let's use some regression models and test how well they can model and predict the data. 
+For simplicity, we will compare a **linear model, forward and backwards stepwise models and lasso regression model** and compare the results at the end of the report. 
+
+First let's create a new variable which we will call **train**
+``` {r}
+train <- as.data.frame(read.csv("/Users/connorsimpson-craib/Documents/UCL/BigData/iftcode/DataBases/csv/train.csv"))
+```
+
+For simplicity, we want to select only numeric variables (i.e., discard Date, logical and factor variables):
+  
+```{r}
+train.number <- train[, sapply(train, is.integer) | sapply(train, is.numeric)]
+```
+
+
+We have also seen above that there are a significant amount of NA variables which might subject our analysis to bias, so we subset only observations without NA values. This gives us about 1/5th of the whole data set, but should be good enough to model the data and analyse some of the predictive power of the variables. 
+  
+```{r}
+train2 <- train.number[complete.cases(train.number), ]
+```
+
+
+There are also some predictor variables (like gender related ones) which are highly correlated, so we remove these predictor variables with high correlation to avoid multicollinearity. We do this by using a Variance Inflation Factor (VIF), and removing ones with values greater than 10 (as argued by Hair et. al 1995)
+
+Calculate Variance Inflation Factor (VIF):
+  
+```{r, include=FALSE}
+#install.packages("usdm")
+library(usdm)
+uvif <- usdm::vif(train.number)
+```
+
+Select only variables with **VIF < 10:**
+  
+```{r}
+vars <- uvif[uvif$VIF < 10, "Variables"][-1]
+vars
+train3 <- subset(train2, select = as.character(vars))
+```
+
+As you can see, this leaves us with around 50 relevant predictor variables to use in our analysis.
+
+Next, we split data into  **70% training and and 30%** validation datasets to use for our analysis:
+
+```{r message = FALSE}
+set.seed(1)
+#install.packages("caret")
+library(caret)
+index <- createDataPartition(y = train3$price_doc, p = 0.7, list = FALSE)
+train4 <- train3[index, ]
+validation <- train3[-index, ]
+```
+
+Now we can fit our first model: **linear regression**, and evaluate the models performance on the validation dataset
+  
+```{r}
+linearmodel1 <- lm(price_doc ~ ., data = train4)
+summary(linearmodel1)
+```
+In this model we can see we get an adjusted R-squared of **53.7%**. Let's have a look at some graphs showing relationships between residual vs fitted values, standardised residuals, scale-location and residuals vs leverage.
+
+```{r}
+plot(linearmodel1)
+```
+
+Let's now evaluate the model performance on our validation dataset:
+  
+```{r}
+predicted <- predict(linearmodel1, validation)
+(MSE.lm <- mean((validation$price_doc - predicted)^2))
+```
+
+Here in the we can see we get the mean squared error from this model, which we can use to compare the predictive power of the models tested at the end. 
+
+
+
+**Stepwise Model Selection:**
+
+Now we'll Perform stepwise model selection: both backward and forward, and evaluate model performance on the validation dataset.
+
+First we will start with backward stepwise model selection:
+  
+```{r message = FALSE, include = FALSE}
+library(RcmdrMisc)
+lm.backward <- stepwise(linearmodel1, direction='backward', criterion='AIC')
+```
+
+
+```{r}
+summary(lm.backward)
+```
+
+Interestingly we can see using this model, that almost all variables are statistically significant at the 90% level. And we have an Adj R Squared of **53.8%. **
+
+Let's evaluate this model performance on the validation dataset:
+  
+```{r}
+predicted <- predict(lm.backward, validation)
+(MSE.lm.backward <- mean((validation$price_doc - predicted)^2))
+```
+
+Here we see a MSE which is slightly larger than our linear model. 
+
+
+Now let's try a forward stepwise model selection:
+  
+```{r message = FALSE, include=FALSE}
+lm.forward <- stepwise(linearmodel1, direction='forward', criterion='AIC')
+```
+
+
+```{r}
+summary(lm.forward)
+```
+Using this method, we can see that all variables are significant at the 90% level, and that most of them are in fact significant at a 95% level, too. We also have an adj. R-Squared of **53.8%. **
+
+
+Let's evaluate the model performance on the validation dataset:
+  
+```{r}
+predicted <- predict(lm.forward, validation)
+(MSE.lm.forward <- mean((validation$price_doc - predicted)^2))
+```
+Here we can see a slightly smaller MSE than some of the models tested so far. 
+
+**Lasso Regression**
+
+Lastly, we perform a lasso regression and evaluate the performance of this model on the validation dataset:
+
+```{r}
+library(glmnet)
+lambdas <- 10^seq(2, -2, by = -.1)
+x <- as.matrix(train4[, 1:(ncol(train4) - 1)])
+x  <- apply(x, 2, as.numeric)
+fit <- glmnet(x, train4[,"price_doc"], alpha = 1, lambda = lambdas)
+```
+
+
+```{r}
+crossValidation <- cv.glmnet(x, train4[,"price_doc"], alpha = 1, lambda = lambdas)
+newLambda <- crossValidation$lambda.min
+(lasso.coef <- predict(fit, type = "coefficients", s = newLambda))
+```
+
+```{r}
+x.validation <- as.matrix(validation[, 1:(ncol(validation) - 1)])
+x.validation  <- apply(x.validation, 2, as.numeric)
+predicted <- predict(fit, s = newLambda, newx = x.validation)
+(MSE.lm.lasso <- mean((validation$price_doc - predicted)^2))
+```
+This is the MSE of our lasso regression model, let's compare the MSE's of all of our models in a dataframe below: 
+
+
+```{r}
+data.frame(MSE.lm, MSE.lm.backward, MSE.lm.forward, MSE.lm.lasso)
+```
+Interestingly, we find that our **Forward Stepwise Selection Model** gives us the lowest MSE indicating this is model produces the most accurate predictions in this dataset, comparatively. Also showing the most variables which are statistically significant at the 95% level or higher. 
+
+
+```
+
